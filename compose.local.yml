@@ -1,0 +1,19 @@
+# Solo PostgreSQL para ejecutar Flask directamente en Windows.
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_DB: nerio360
+      POSTGRES_USER: nerio
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD en .env}
+    volumes:
+      - nerio360_local_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nerio -d nerio360"]
+      interval: 5s
+      retries: 12
+volumes:
+  nerio360_local_pg:
