@@ -1,4 +1,4 @@
-import os, uuid, secrets
+import os, uuid, secrets, time, threading, math
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
@@ -12,9 +12,48 @@ from sqlalchemy import or_
 load_dotenv()
 BASE = Path(__file__).resolve().parent
 app = Flask(__name__)
-app.config.update(SECRET_KEY=os.environ.get('SECRET_KEY', secrets.token_hex(32)), SQLALCHEMY_DATABASE_URI=os.environ.get('DATABASE_URL','postgresql+psycopg://nerio:nerio@localhost:5432/nerio360'), SQLALCHEMY_TRACK_MODIFICATIONS=False, MAX_CONTENT_LENGTH=8*1024*1024, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE')=='1')
+app.config.update(SECRET_KEY=os.environ.get('SECRET_KEY') or (secrets.token_hex(32) if os.environ.get('FLASK_DEBUG')=='1' or os.environ.get('TESTING')=='1' else None), SQLALCHEMY_DATABASE_URI=os.environ.get('DATABASE_URL','postgresql+psycopg://nerio:nerio@localhost:5432/nerio360'), SQLALCHEMY_TRACK_MODIFICATIONS=False, MAX_CONTENT_LENGTH=8*1024*1024, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE')=='1')
+if not app.config['SECRET_KEY']:
+    raise RuntimeError('SECRET_KEY debe configurarse para ejecutar NERIO360 de forma segura')
 app.config['UPLOAD_FOLDER'] = str(BASE/'static'/'uploads')
 db = SQLAlchemy(app)
+# Protección básica de acceso administrativo; para múltiples réplicas usar Redis o un limitador compartido.
+_login_attempts = {}
+_login_lock = threading.Lock()
+LOGIN_WINDOW = 15 * 60
+LOGIN_MAX_ATTEMPTS = 8
+
+def _login_key():
+    # No confiar en X-Forwarded-For salvo que exista ProxyFix con proxies confiables.
+    return request.remote_addr or 'unknown'
+
+def _login_limited(key):
+    now = time.monotonic()
+    with _login_lock:
+        attempts = [t for t in _login_attempts.get(key, []) if now - t < LOGIN_WINDOW]
+        _login_attempts[key] = attempts
+        return len(attempts) >= LOGIN_MAX_ATTEMPTS
+
+def _record_login_failure(key):
+    with _login_lock:
+        _login_attempts.setdefault(key, []).append(time.monotonic())
+
+def _clear_login_failures(key):
+    with _login_lock:
+        _login_attempts.pop(key, None)
+
+@app.after_request
+def security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
+    if request.path.startswith('/admin'):
+        response.headers['Cache-Control'] = 'no-store'
+    if request.is_secure:
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    return response
+
 
 class Admin(db.Model):
     id=db.Column(db.Integer,primary_key=True)
@@ -73,7 +112,7 @@ def csrf_context():
 
 @app.before_request
 def check_csrf():
-    if request.method in ('POST','PUT','PATCH','DELETE') and not secrets.compare_digest(request.form.get('csrf_token',''),session.get('csrf','')):
+    if request.method in ('POST','PUT','PATCH','DELETE') and (not session.get('csrf') or not secrets.compare_digest(request.form.get('csrf_token',''),session.get('csrf',''))):
         abort(400,'Formulario inválido. Recarga la página.')
 
 def admin_required(fn):
@@ -89,7 +128,9 @@ def integer(name, default=0):
 
 def save_photos(prop):
     allowed={'jpg','jpeg','png','webp'}
-    for file in request.files.getlist('photos')[:8]:
+    files = request.files.getlist('photos')
+    if len(files) > 8: abort(400, 'Máximo 8 imágenes por carga')
+    for file in files:
         if not file or not file.filename: continue
         ext=secure_filename(file.filename).rsplit('.',1)[-1].lower()
         if ext not in allowed: abort(400,'Formato de imagen no permitido')
@@ -100,7 +141,7 @@ def save_photos(prop):
             file.stream.seek(0)
             image=Image.open(file.stream).convert('RGB')
             image.thumbnail((1800,1800))
-        except (UnidentifiedImageError,OSError,ValueError): abort(400,'Imagen no válida')
+        except (UnidentifiedImageError,OSError,ValueError,Image.DecompressionBombError): abort(400,'Imagen no válida')
         name=f'{uuid.uuid4().hex}.jpg'
         image.save(Path(app.config['UPLOAD_FOLDER'])/name,'JPEG',quality=84,optimize=True)
         db.session.add(Photo(property=prop,filename=name))
@@ -117,7 +158,7 @@ def fill_property(prop):
     try:
         prop.latitude=float(request.form['latitude']);prop.longitude=float(request.form['longitude'])
     except ValueError: abort(400,'Coordenadas inválidas')
-    if not (-90<=prop.latitude<=90 and -180<=prop.longitude<=180): abort(400,'Coordenadas fuera de rango')
+    if not (math.isfinite(prop.latitude) and math.isfinite(prop.longitude) and -90<=prop.latitude<=90 and -180<=prop.longitude<=180): abort(400,'Coordenadas fuera de rango')
     if prop.price<0 or min(prop.bedrooms,prop.bathrooms,prop.area)<0: abort(400,'Valores negativos')
     prop.status=request.form.get('status','disponible')
     if prop.status not in ('disponible','reservada','vendida'): abort(400,'Estado inválido')
@@ -161,10 +202,14 @@ def interest(id):
 @app.route('/admin/login',methods=['GET','POST'])
 def login():
     if request.method=='POST':
+        key = _login_key()
+        if _login_limited(key): abort(429, 'Demasiados intentos. Intenta más tarde.')
         admin=Admin.query.filter_by(email=request.form.get('email','').strip().lower()).first()
         if admin and check_password_hash(admin.password_hash,request.form.get('password','')):
+            _clear_login_failures(key)
             session.clear();session['admin_id']=admin.id
             return redirect(url_for('dashboard'))
+        _record_login_failure(key)
         flash('Credenciales incorrectas','error')
     return render_template('login.html')
 
